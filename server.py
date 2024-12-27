@@ -3,12 +3,14 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from flask import Flask, request
 from bson import json_util
+from flask_cors import CORS
 import json
 
 load_dotenv()
 db_user = os.getenv('DBUSER')
 db_pass = os.getenv('DBPASS')
 app = Flask(__name__)
+CORS(app)
 
 def get_database():
     CONNECTION_STRING = f"mongodb+srv://{db_user}:{db_pass}@personalsite.qbhpviu.mongodb.net/?retryWrites=true&w=majority&appName=PersonalSite"
