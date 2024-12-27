@@ -64,5 +64,25 @@ def api_get_quotes():
     response = jsonify(db.find_one()['quotes'])
     return response
 
+@app.route('/updateTest', methods=['PUT'])
+def api_update_test():
+    print("PUT /updateTest endpoint hit")
+    print(request.get_json())
+    try:
+        data = request.get_json()
+        if 'data' not in data:
+            return {"error": "No test data provided"}, 400
+        
+        result = db.update_one({}, {'$set': {'test': data['data']}})
+
+        if result.modified_count > 0:
+            return {"status": "Success", "message": "Test updated successfully"}, 200
+        else:
+            return {"status": "Failed", "message": "No changes made to the database"}, 400
+        
+    except Exception as e:
+        print(f"Update error: {str(e)}")
+        return {"error": "Database connection failed"}, 500
+
 if __name__ == '__main__':
     app.run(debug=True)
