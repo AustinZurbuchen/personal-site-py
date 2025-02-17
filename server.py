@@ -1,12 +1,12 @@
 import os
-from dotenv import load_dotenv
+from dotenv import main
 from pymongo import MongoClient
 from flask import Flask, request
 from bson import json_util
 from flask_cors import CORS
 import json
 
-load_dotenv()
+main.load_dotenv()
 db_user = os.getenv('DBUSER')
 db_pass = os.getenv('DBPASS')
 app = Flask(__name__)
