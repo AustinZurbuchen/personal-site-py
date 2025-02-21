@@ -1,10 +1,14 @@
 FROM python:3.9-slim
 
-COPY server.py /server.py
+WORKDIR /
 
-RUN pip install python-dotenv
-RUN pip install pymongo
-RUN pip install flask
-RUN pip install flask-cors
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-CMD ["python", "-u", "/server.py"]
+COPY . .
+
+# Make port 5000 available outside the container
+EXPOSE 5000
+
+# Run the Flask app with host=0.0.0.0 to make it accessible outside the container
+CMD ["python", "-m", "flask", "run", "--host=0.0.0.0"]
