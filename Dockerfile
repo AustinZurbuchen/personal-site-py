@@ -1,7 +1,5 @@
-FROM python:3.9-slim-buster
+FROM python:3.9-slim
 
-WORKDIR /
+COPY server.py /server.py
 
-COPY server.py .
-
-CMD ["python", "server.py"]
+CMD ["python", "-u", "/server.py"]
