@@ -4,13 +4,14 @@ from pymongo import MongoClient
 from flask import Flask, request
 from bson import json_util
 from flask_cors import CORS
+from utils import sort_work_items
 import json
 
 main.load_dotenv()
 db_user = os.getenv('DBUSER')
 db_pass = os.getenv('DBPASS')
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"], supports_credentials=True)
 
 def get_database():
     CONNECTION_STRING = f"mongodb+srv://{db_user}:{db_pass}@personalsite.qbhpviu.mongodb.net/?retryWrites=true&w=majority&appName=PersonalSite"
@@ -29,6 +30,7 @@ def get_resume():
         resume = db.find_one()
         if resume is None:
             return {"error": "No resume found in database"}, 404
+        resume['experiences']['work'] = sort_work_items(resume['experiences']['work'])
         return jsonify(resume)
     except Exception as e:
         print(f"Database error: {str(e)}")
