@@ -11,7 +11,13 @@ main.load_dotenv()
 db_user = os.getenv('DBUSER')
 db_pass = os.getenv('DBPASS')
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"], supports_credentials=True)
+
+cors_origins = os.getenv(
+    'CORS_ORIGINS',
+    'http://10.0.0.24:8080'
+)
+allowed_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
+CORS(app, origins=allowed_origins, supports_credentials=True)
 
 def get_database():
     CONNECTION_STRING = f"mongodb+srv://{db_user}:{db_pass}@personalsite.qbhpviu.mongodb.net/?retryWrites=true&w=majority&appName=PersonalSite"
