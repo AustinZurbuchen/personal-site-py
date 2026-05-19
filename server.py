@@ -14,7 +14,6 @@ app = Flask(__name__)
 
 cors_origins = os.getenv(
     'CORS_ORIGINS',
-    'http://10.0.0.24:8080',
     'https://austinzurbuchen.com'
 )
 allowed_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
