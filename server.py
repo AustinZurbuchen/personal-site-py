@@ -12,11 +12,9 @@ db_user = os.getenv('DBUSER')
 db_pass = os.getenv('DBPASS')
 app = Flask(__name__)
 
-cors_origins = os.getenv(
-    'CORS_ORIGINS',
-    'https://austinzurbuchen.com'
-)
+cors_origins = os.getenv('CORS_ORIGINS') or 'https://austinzurbuchen.com'
 allowed_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
+print(f'CORS allowed origins: {allowed_origins}', flush=True)
 CORS(app, origins=allowed_origins, supports_credentials=True)
 
 def get_database():
