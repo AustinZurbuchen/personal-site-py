@@ -37,12 +37,16 @@ Because of that proxy the API is same-origin in production, so the wide-open
 
 ## Security posture — read before touching routes
 
-This service is on the public internet with no authentication layer.
+This service is on the public internet. Write routes are gated by a shared
+bearer token; there is no per-user authentication.
 
-- **`PUT /updateTest` is unauthenticated and live.** It runs
-  `db.update_one({}, {'$set': ...})` — an empty filter, matching the first
-  document in the collection. Anyone who can reach the host can write to the
-  resume record. Locking this down takes priority over adding features.
+- **`PUT /updateTest` is guarded by a bearer token.** It requires
+  `Authorization: Bearer $ADMIN_TOKEN`, compared with `hmac.compare_digest`
+  by the `require_token` decorator, and scopes its write by `_id` rather than
+  the empty filter it used to use. The guard **fails closed**: with
+  `ADMIN_TOKEN` unset the route returns 503 instead of running
+  unauthenticated. Never "fix" that 503 by removing the decorator — set the
+  env var. Apply `@require_token` to every future write route.
 - **`POST /login` compares passwords in plaintext** (`admin['password'] !=
   data['password']`) and issues no token, cookie, or session on success — the
   caller just gets `{"status": "Success"}`. It is not a usable auth mechanism
@@ -51,10 +55,14 @@ This service is on the public internet with no authentication layer.
 - Credentials come from `.env` (`DBUSER`, `DBPASS`) and are interpolated into
   the connection string. `.env` is gitignored; keep it that way and never echo
   those values into logs or output.
-- No input validation or rate limiting anywhere.
+- No rate limiting anywhere. `PUT /updateTest` validates its body; no other
+  route validates input.
 
-When adding a write endpoint, it needs auth, a scoped filter (never `{}`), and
-validation of the request body — in that order.
+When adding a write endpoint, it needs `@require_token`, a scoped filter
+(never `{}`), and validation of the request body — in that order.
+
+Config lives in `.env` (gitignored); `.env.example` documents the required
+keys. Adding a new one means updating `.env.example` too.
 
 ## Known issues
 
@@ -66,8 +74,6 @@ validation of the request body — in that order.
 - Route handlers other than `/getResume` have no error handling — a missing
   key raises and returns a 500 with a stack trace under debug.
 - No tests.
-- `server.py` currently has uncommitted local changes (the `/login` work and
-  the `admins` collection split).
 
 ## Conventions
 
