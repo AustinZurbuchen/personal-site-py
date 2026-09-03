@@ -12,7 +12,9 @@ on a Synology NAS as a sibling container to the frontend.
 
 ## Layout
 
-- `server.py` — the entire application. Routes, DB access, serialization.
+- `server.py` — routes, DB access, serialization.
+- `utils.py` — `sort_work_items`, ordering work experience current-first then
+  by date. Applied in `GET /getResume`.
 - `hello.py` — a leftover scaffold, unused.
 - Collections: `resumes` (single document, read by every GET) and `admins`.
 
@@ -32,8 +34,11 @@ Docker network. That network is **not** declared in the frontend's
 `docker-compose.yml` — it is wired up manually on the NAS. Renaming the
 container or changing the network breaks the site with no build-time warning.
 
-Because of that proxy the API is same-origin in production, so the wide-open
-`CORS(app)` is not actually load-bearing.
+Because of that proxy the API is same-origin in production, so CORS is not
+exercised there at all. `CORS(...)` is scoped to `http://localhost:3000` and
+`http://127.0.0.1:3000` with `supports_credentials=True`, which matters only
+for local dev against a remote API. Widening it would not help production and
+would expose the API to any origin.
 
 `docker-compose.yml` builds this service as `personal-site-py` (the
 `container_name` is load-bearing — nginx resolves it) and loads secrets from
@@ -74,9 +79,9 @@ keys. Adding a new one means updating `.env.example` too.
 
 ## Known issues
 
-- `requirements.txt` pins nothing — builds are not reproducible. A rebuild
-  today pulls whatever is current, which is already true of the running
-  image; pinning would reduce that risk.
+- `requirements.txt` pins only `pymongo>=4.6`; everything else floats, so a
+  rebuild pulls whatever is current. That is already true of the running
+  image; pinning the rest would reduce the risk.
 - `app.run(debug=True)` remains in `__main__` for local runs. The container
   no longer uses it (gunicorn serves the app), but never start the container
   that way — it binds loopback and enables the interactive debugger.
