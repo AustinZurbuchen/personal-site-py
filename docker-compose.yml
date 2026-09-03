@@ -21,16 +21,14 @@ services:
 
     restart: unless-stopped
 
-# NOTE: this container and the frontend must share a Docker network for
-# the hostname `personal-site-py` to resolve from nginx. That network is
-# currently wired up by hand on the NAS and is declared in neither repo.
-# No network is declared here so this file cannot fight the existing
-# setup. To make it explicit later, create one shared network and add it
-# to both compose files:
+# The frontend and this service share the `zurbnet` network so nginx can
+# resolve the hostname `personal-site-py`. Declared external because the
+# network is created and owned outside these compose files — compose will
+# not create it, and `docker compose up` fails fast if it is missing rather
+# than silently attaching to a private network nginx cannot reach.
 #
-#   docker network create personal-site-net
-#
-#   networks:
-#     default:
-#       name: personal-site-net
-#       external: true
+#   docker network create zurbnet   # if it ever needs recreating
+networks:
+  default:
+    name: zurbnet
+    external: true

@@ -30,9 +30,14 @@ one resume document.
 
 The frontend's nginx proxies `/api/` → `http://personal-site-py:5000/`, so the
 container must be resolvable under the hostname `personal-site-py` on a shared
-Docker network. That network is **not** declared in the frontend's
-`docker-compose.yml` — it is wired up manually on the NAS. Renaming the
-container or changing the network breaks the site with no build-time warning.
+Docker network. That network is `zurbnet`, declared `external: true` in both
+repos' `docker-compose.yml`. It is created outside compose
+(`docker network create zurbnet`), so compose will not recreate it and
+`docker compose up` fails fast if it is missing rather than silently
+attaching to a private network nginx cannot reach.
+
+Renaming the container breaks the proxy with no build-time warning — the
+`container_name` in `docker-compose.yml` is load-bearing.
 
 Because of that proxy the API is same-origin in production, so CORS is not
 exercised there at all. `CORS(...)` is scoped to `http://localhost:3000` and
