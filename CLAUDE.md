@@ -35,6 +35,14 @@ container or changing the network breaks the site with no build-time warning.
 Because of that proxy the API is same-origin in production, so the wide-open
 `CORS(app)` is not actually load-bearing.
 
+`docker-compose.yml` builds this service as `personal-site-py` (the
+`container_name` is load-bearing — nginx resolves it) and loads secrets from
+`.env` at container start via `env_file`. `.dockerignore` keeps `.env` out of
+the build context, so **secrets are no longer baked into the image** and the
+container will start without credentials if `.env` is missing beside the
+compose file. `Dockerfile` serves the app with gunicorn bound to
+`0.0.0.0:5000`.
+
 ## Security posture — read before touching routes
 
 This service is on the public internet. Write routes are gated by a shared
@@ -66,11 +74,13 @@ keys. Adding a new one means updating `.env.example` too.
 
 ## Known issues
 
-- **The Dockerfile `CMD` is wrong**: `python -m server run --host=0.0.0.0` is
-  not a valid invocation of this app. Should be gunicorn, or at minimum
-  `flask --app server run`.
-- `requirements.txt` pins nothing — builds are not reproducible.
-- `app.run(debug=True)` in `__main__`; debug must never reach production.
+- `requirements.txt` pins nothing — builds are not reproducible. A rebuild
+  today pulls whatever is current, which is already true of the running
+  image; pinning would reduce that risk.
+- `app.run(debug=True)` remains in `__main__` for local runs. The container
+  no longer uses it (gunicorn serves the app), but never start the container
+  that way — it binds loopback and enables the interactive debugger.
+- The image runs as root and `hello.py` is still copied into it.
 - Route handlers other than `/getResume` have no error handling — a missing
   key raises and returns a 500 with a stack trace under debug.
 - No tests.

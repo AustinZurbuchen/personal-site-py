@@ -1,0 +1,36 @@
+services:
+  personal-site-py:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # The frontend's nginx proxies /api/ to http://personal-site-py:5000/,
+    # so this name is load-bearing — changing it breaks the site.
+    container_name: personal-site-py
+
+    # Secrets come from .env on the host at container start. They are no
+    # longer copied into the image (see .dockerignore), so this file must
+    # exist next to this compose file or the container starts without
+    # DBUSER/DBPASS/ADMIN_TOKEN. See .env.example for the required keys.
+    env_file:
+      - .env
+
+    # Not published to the host: only the frontend's nginx needs to reach
+    # this, over the shared Docker network.
+    expose:
+      - "5000"
+
+    restart: unless-stopped
+
+# NOTE: this container and the frontend must share a Docker network for
+# the hostname `personal-site-py` to resolve from nginx. That network is
+# currently wired up by hand on the NAS and is declared in neither repo.
+# No network is declared here so this file cannot fight the existing
+# setup. To make it explicit later, create one shared network and add it
+# to both compose files:
+#
+#   docker network create personal-site-net
+#
+#   networks:
+#     default:
+#       name: personal-site-net
+#       external: true

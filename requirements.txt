@@ -2,3 +2,4 @@ python-dotenv
 pymongo>=4.6
 flask
 flask-cors
+gunicorn
