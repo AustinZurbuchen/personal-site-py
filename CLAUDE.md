@@ -8,7 +8,15 @@ Atlas to the `personal-site` React frontend (separate repo,
 
 Flask · PyMongo → MongoDB Atlas (`personalsite.qbhpviu.mongodb.net`, db `test`)
 · flask-cors · python-dotenv. Everything lives in `server.py`. Runs in Docker
-on a Synology NAS as a sibling container to the frontend.
+on an Unraid NAS as a sibling container to the frontend.
+
+**Deploys are registry-based.** The container is managed by Unraid's Docker
+Manager (label `net.unraid.docker.managed: dockerman`), which pulls a
+published image — there is no repo checkout or compose project on the NAS.
+`.github/workflows/publish.yml` builds `linux/amd64` on push to `master` and
+pushes to GHCR; the NAS pulls it. `docker-compose.yml` documents the topology
+and is useful locally, but is **not** what runs in production, so a change
+there does not reach the NAS on its own.
 
 ## Layout
 
