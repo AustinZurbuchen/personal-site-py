@@ -60,9 +60,6 @@ def resumes():
     return get_client()['test']['resumes']
 
 
-def admins():
-    return get_client()['test']['admins']
-
 def jsonify(text):
     return json.loads(json_util.dumps(text))
 
@@ -99,7 +96,9 @@ def require_token(handler):
 def get_resume():
     print("GET /getResume endpoint hit")
     try:
-        resume = resumes().find_one()
+        # _id projected out: nothing in the frontend reads it, and it keeps a
+        # {"$oid": ...} extended-JSON blob out of the public response.
+        resume = resumes().find_one({}, {'_id': 0})
         if resume is None:
             return {"error": "No resume found in database"}, 404
         resume['experiences']['work'] = sort_work_items(resume['experiences']['work'])
@@ -108,72 +107,5 @@ def get_resume():
         print(f"Database error: {str(e)}")
         return {"error": "Database connection failed"}, 500
     
-@app.route('/getAbilities', methods=['GET'])
-def api_get_abilites():
-    print("GET /getAbilities endpoint hit")
-    response = jsonify(resumes().find_one()['abilities'])
-    return response
-
-@app.route('/getExperiences', methods=['GET'])
-def api_get_experiences():
-    print("GET /getExperiences endpoint hit")
-    response = jsonify(resumes().find_one()['experiences'])
-    return response
-
-@app.route('/getLinks', methods=['GET'])
-def api_get_links():
-    print("GET /getLinks endpoint hit")
-    response = jsonify(resumes().find_one()['links'])
-    return response
-
-@app.route('/getProfile', methods=['GET'])
-def api_get_profile():
-    print("GET /getProfile endpoint hit")
-    response = jsonify(resumes().find_one()['profile'])
-    return response
-
-@app.route('/getQuotes', methods=['GET'])
-def api_get_quotes():
-    print("GET /getQuotes endpoint hit")
-    response = jsonify(resumes().find_one()['quotes'])
-    return response
-
-@app.route('/updateTest', methods=['PUT'])
-@require_token
-def api_update_test():
-    print("PUT /updateTest endpoint hit")
-    try:
-        data = request.get_json(silent=True) or {}
-        value = data.get('data')
-        if not isinstance(value, str):
-            return {"error": "Field 'data' is required and must be a string"}, 400
-
-        resume = resumes().find_one({}, {'_id': 1})
-        if resume is None:
-            return {"error": "No resume found in database"}, 404
-
-        result = resumes().update_one({'_id': resume['_id']}, {'$set': {'test': value}})
-        if result.matched_count == 0:
-            return {"error": "No resume found in database"}, 404
-
-        return {"status": "Success", "message": "Test updated successfully"}, 200
-
-    except Exception as e:
-        print(f"Update error: {str(e)}")
-        return {"error": "Database connection failed"}, 500
-
-@app.route('/login', methods=['POST'])
-def api_login():
-    print("POST /login endpoint hit")
-    data = request.get_json()
-    if 'username' not in data or 'password' not in data:
-        return {"error": "Username and password are required"}, 400
-    admin = admins().find_one({'username': data['username']})
-    if admin is None:
-        return {"error": "Invalid username or password"}, 401
-    if admin['password'] != data['password']:
-        return {"error": "Invalid username or password"}, 401
-    return {"status": "Success", "message": "Login successful"}, 200
-
 if __name__ == '__main__':
     app.run(debug=True)

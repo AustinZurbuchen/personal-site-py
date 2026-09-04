@@ -20,19 +20,24 @@ there does not reach the NAS on its own.
 
 ## Layout
 
-- `server.py` — routes, DB access, serialization.
+- `server.py` — one route (`GET /getResume`), DB access, serialization.
 - `utils.py` — `sort_work_items`, ordering work experience current-first then
   by date. Applied in `GET /getResume`.
-- `hello.py` — a leftover scaffold, unused.
-- Collections: `resumes` (single document, read by every GET) and `admins`.
+- Collections: `resumes`, holding a single document.
+
+**The API surface is deliberately one read-only route.** Five other GET routes,
+`PUT /updateTest` and `POST /login` were deleted once an audit confirmed the
+frontend calls only `/getResume`; `/getExperiences` had already drifted to
+returning work unsorted. `require_token` is kept unused on purpose — the
+planned `PUT /updateResume` uses it.
 
 `jsonify()` here is a local helper wrapping `bson.json_util`, **not**
 `flask.jsonify`. It passes Mongo extended JSON straight through, so responses
 include `_id` as `{"$oid": "..."}`. The frontend tolerates this; changing the
 shape is a breaking change.
 
-Every GET calls `resumes().find_one()` with no filter and returns a subtree of
-the one resume document.
+`GET /getResume` projects `_id` out. Nothing in the frontend reads it, and it
+keeps a `{"$oid": ...}` extended-JSON blob out of the public response.
 
 **The MongoClient is built lazily, once, by `get_client()`.** Do not move it
 back to module scope. A `mongodb+srv://` URI resolves DNS inside the
@@ -83,11 +88,12 @@ bearer token; there is no per-user authentication.
   The guard **fails closed**: with `ADMIN_TOKEN` unset the route returns 503
   instead of running unauthenticated. Never "fix" that 503 by removing the decorator — set the
   env var. Apply `@require_token` to every future write route.
-- **`POST /login` compares passwords in plaintext** (`admin['password'] !=
-  data['password']`) and issues no token, cookie, or session on success — the
-  caller just gets `{"status": "Success"}`. It is not a usable auth mechanism
-  and must not be treated as one. It is also not currently deployed
-  (`/api/login` returns 404 in production).
+- **The public API is read-only by proof, not convention.** The frontend's
+  `nginx.conf` wraps `location /api/` in `limit_except GET HEAD { deny all; }`,
+  so no non-GET method reaches Flask from the internet regardless of any
+  application bug. The planned admin vhost is a separate server block on an
+  unpublished port and does not carry that restriction. Do not remove it to
+  "make writes work" — that is what the admin vhost is for.
 - Credentials come from `.env` (`DBUSER`, `DBPASS`) and are interpolated into
   the connection string. `.env` is gitignored; keep it that way and never echo
   those values into logs or output.
@@ -108,18 +114,7 @@ keys. Adding a new one means updating `.env.example` too.
 - `app.run(debug=True)` remains in `__main__` for local runs. The container
   no longer uses it (gunicorn serves the app), but never start the container
   that way — it binds loopback and enables the interactive debugger.
-- The image runs as root and `hello.py` is still copied into it.
-- Route handlers other than `/getResume` have no error handling — a missing
-  key raises and returns a 500 with a stack trace under debug.
-- The five non-`/getResume` GET routes and `/login` have no callers at all;
-  the frontend uses only `/getResume`. `/getExperiences` has already drifted —
-  it returns work unsorted, because `sort_work_items` was only applied in
-  `/getResume`.
-- `POST /login` raises on a `null` JSON body (`get_json()` without
-  `silent=True`), and its Mongo filter takes the request value directly, so
-  `{"username": {"$ne": null}}` matches any admin. It cannot bypass the
-  password — that check is a Python comparison, not a query — but it confirms
-  an admin exists.
+- The image runs as root.
 - `print()` is block-buffered under Docker and there is no `PYTHONUNBUFFERED`,
   so the per-handler log convention below does not actually reach the NAS log
   promptly.
