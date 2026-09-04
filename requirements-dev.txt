@@ -1,0 +1,3 @@
+# Test-only. Never installed into the image — see .dockerignore.
+-r requirements.txt
+pytest>=8

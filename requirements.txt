@@ -3,3 +3,8 @@ pymongo>=4.6
 flask
 flask-cors
 gunicorn
+# Both ship with Flask already; pinned explicitly because server.py imports
+# them directly (scrypt hashing, session token signing) rather than through
+# Flask, and a transitive dependency is not a contract.
+werkzeug>=3.0,<4
+itsdangerous>=2.1,<3

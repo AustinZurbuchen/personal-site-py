@@ -9,6 +9,10 @@
 .dockerignore
 .claude/
 
+# Tests and dev tooling never ship in the image
+test_*.py
+requirements-dev.txt
+
 # Python build artifacts
 __pycache__/
 *.py[cod]

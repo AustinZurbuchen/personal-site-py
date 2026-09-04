@@ -1,0 +1,392 @@
+"""Tests for the admin session and write endpoints.
+
+Runs with NO network and NO Atlas access. server.py builds its MongoClient
+lazily inside get_client(), which is the seam: the fixture replaces the three
+collection accessors, so no client is ever constructed and nothing resolves
+DNS. A test that reached the network would hang, not fail, so the fake also
+asserts it is the thing being used.
+
+Run:  python -m pytest -q
+"""
+import os
+import copy
+
+import pytest
+
+os.environ.setdefault('ADMIN_SESSION_SECRET', 'k' * 40)
+os.environ.setdefault('DBUSER', 'testuser')
+os.environ.setdefault('DBPASS', 'testpass')
+
+import server  # noqa: E402
+from werkzeug.security import generate_password_hash  # noqa: E402
+
+PASSWORD = 'correct horse battery staple'
+
+RESUME = {
+    '_id': 'resume-1',
+    'profile': {'name': 'Austin Zurbuchen', 'subtitle': 'Passionate Software Developer',
+                'description': 'BEFORE', 'age': '30 years', 'location': 'Folsom, California'},
+    'experiences': {
+        'school': [{'company': 'SJSU', 'dateLabel': 'May 2018', 'title': 'BS', 'body': '.'}],
+        'work': [
+            {'company': 'BeyondID', 'dateLabel': 'a', 'title': 't', 'body': 'b',
+             'isCurrent': False, 'startDate': '2021', 'endDate': '2022'},
+            {'company': 'Ambii', 'dateLabel': 'c', 'title': 'u', 'body': 'v',
+             'isCurrent': False, 'startDate': '2017', 'endDate': '2021'},
+        ],
+    },
+    'abilities': {'languages': [{'ability': 'ReactJS', 'stars': '5'}],
+                  'technologies': [{'ability': 'Git', 'stars': '5'}]},
+    'quotes': [{'quote': 'q0', 'by': '- a'}, {'quote': 'q1', 'by': '- b'},
+               {'quote': 'q2', 'by': '- c'}],
+    'links': {'email': 'e@example.com', 'linkedin': 'https://l', 'github': 'https://g'},
+}
+
+
+class FakeCursor(list):
+    def sort(self, *a, **k):
+        return self
+
+    def limit(self, n):
+        return FakeCursor(self[:n])
+
+
+class FakeCollection:
+    def __init__(self, docs=None):
+        self.docs = docs if docs is not None else []
+        self.inserted = []
+        self.deleted = []
+
+    def find_one(self, flt=None, projection=None):
+        for d in self.docs:
+            if not flt or all(d.get(k) == v for k, v in flt.items()):
+                out = copy.deepcopy(d)
+                if projection and projection.get('_id') == 0:
+                    out.pop('_id', None)
+                return out
+        return None
+
+    def find(self, flt=None, projection=None):
+        return FakeCursor([copy.deepcopy(d) for d in self.docs])
+
+    def update_one(self, flt, update):
+        target = None
+        for d in self.docs:
+            if all(d.get(k) == v for k, v in flt.items()):
+                target = d
+                break
+
+        class Result:
+            matched_count = 1 if target else 0
+            modified_count = 1 if target else 0
+
+        if target:
+            for path, value in update.get('$set', {}).items():
+                node = target
+                parts = path.split('.')
+                for seg in parts[:-1]:
+                    node = node[int(seg)] if seg.isdigit() else node[seg]
+                key = parts[-1]
+                if isinstance(node, list):
+                    node[int(key)] = value
+                else:
+                    node[key] = value
+        return Result()
+
+    def insert_one(self, doc):
+        # Real Mongo assigns _id on insert; the fake must too, or the prune
+        # reads a key that only exists in production.
+        doc.setdefault('_id', f'gen-{len(self.docs)}')
+        self.inserted.append(copy.deepcopy(doc))
+        self.docs.append(doc)
+        return type('R', (), {'inserted_id': doc['_id']})()
+
+    def delete_many(self, flt):
+        self.deleted.append(flt)
+        return type('R', (), {'deleted_count': 0})()
+
+
+@pytest.fixture
+def db(monkeypatch):
+    resumes = FakeCollection([copy.deepcopy(RESUME)])
+    admins = FakeCollection([{
+        'username': 'austin',
+        'password_hash': generate_password_hash(PASSWORD, method='scrypt'),
+    }])
+    backups = FakeCollection([])
+
+    monkeypatch.setattr(server, 'resumes', lambda: resumes)
+    monkeypatch.setattr(server, 'admins', lambda: admins)
+    monkeypatch.setattr(server, 'backups', lambda: backups)
+
+    def boom():
+        raise AssertionError('server.py constructed a real MongoClient')
+    monkeypatch.setattr(server, 'get_client', boom)
+
+    return {'resumes': resumes, 'admins': admins, 'backups': backups}
+
+
+@pytest.fixture
+def client():
+    server.app.testing = True
+    return server.app.test_client()
+
+
+def login(client, password=PASSWORD, username='austin'):
+    return client.post('/session', json={'username': username, 'password': password})
+
+
+def auth(client):
+    return {'Authorization': 'Bearer ' + login(client).get_json()['token']}
+
+
+# ---------------------------------------------------------------- sessions
+
+def test_correct_credentials_return_a_token(client, db):
+    r = login(client)
+    assert r.status_code == 200
+    assert r.get_json()['token']
+    assert r.get_json()['expiresIn'] == server.SESSION_TTL_SECONDS
+
+
+@pytest.mark.parametrize('password', ['wrong', '', PASSWORD + ' ', PASSWORD.upper()])
+def test_wrong_password_is_rejected(client, db, password):
+    assert login(client, password=password).status_code in (400, 401)
+
+
+def test_unknown_username_is_rejected(client, db):
+    assert login(client, username='nobody').status_code == 401
+
+
+def test_the_same_error_for_bad_user_and_bad_password(client, db):
+    """Neither response may reveal whether the username exists."""
+    a = login(client, username='nobody').get_json()
+    b = login(client, password='wrong').get_json()
+    assert a == b
+
+
+@pytest.mark.parametrize('body', [None, [], 'x', 42, {}, {'username': 'austin'},
+                                  {'username': None, 'password': 'x'},
+                                  {'username': 'a', 'password': {'$ne': None}}])
+def test_malformed_login_bodies_are_rejected_not_crashed(client, db, body):
+    assert client.post('/session', json=body).status_code in (400, 401)
+
+
+def test_a_password_longer_than_the_cap_never_reaches_scrypt(client, db):
+    r = client.post('/session', json={'username': 'austin',
+                                      'password': 'x' * (server.MAX_PASSWORD_LENGTH + 1)})
+    assert r.status_code == 400
+
+
+def test_a_plaintext_password_field_does_not_authenticate(client, db):
+    """The collection this replaced stored `password`. If a stale document
+    survives the migration it must not log anyone in."""
+    db['admins'].docs[0] = {'username': 'austin', 'password': PASSWORD}
+    assert login(client).status_code == 401
+
+
+# ------------------------------------------------------------------- auth
+
+@pytest.mark.parametrize('headers', [
+    {},
+    {'Authorization': ''},
+    {'Authorization': 'Bearer'},
+    {'Authorization': 'Bearer '},
+    {'Authorization': 'Bearer nonsense'},
+    {'Authorization': 'Basic ' + 'x' * 20},
+    {'Authorization': 'bearer lowercase-scheme'},
+    {'Authorization': 'Bearer toké'},          # non-ASCII must 401, never 500
+    {'Authorization': 'Bearer tok\U0001f600'},
+])
+def test_every_bad_credential_is_a_401(client, db, headers):
+    r = client.put('/updateResume', json={'updates': {'profile.description': 'x'}},
+                   headers=headers)
+    assert r.status_code == 401
+
+
+def test_a_token_signed_with_another_key_is_rejected(client, db):
+    from itsdangerous import URLSafeTimedSerializer
+    forged = URLSafeTimedSerializer('a' * 40, salt=server.SESSION_SALT).dumps({'u': 'austin'})
+    r = client.put('/updateResume', json={'updates': {'profile.description': 'x'}},
+                   headers={'Authorization': 'Bearer ' + forged})
+    assert r.status_code == 401
+
+
+def test_an_expired_token_is_rejected(client, db, monkeypatch):
+    token = login(client).get_json()['token']
+    monkeypatch.setattr(server, 'SESSION_TTL_SECONDS', -1)
+    r = client.put('/updateResume', json={'updates': {'profile.description': 'x'}},
+                   headers={'Authorization': 'Bearer ' + token})
+    assert r.status_code == 401
+    assert r.get_json()['code'] == 'session_expired'
+
+
+def test_writes_fail_closed_when_no_secret_is_configured(client, db, monkeypatch):
+    monkeypatch.setattr(server, 'SESSION_SECRET', '')
+    r = client.put('/updateResume', json={'updates': {'profile.description': 'x'}},
+                   headers={'Authorization': 'Bearer anything'})
+    assert r.status_code == 503
+
+
+def test_a_short_secret_is_treated_as_unconfigured(client, db, monkeypatch):
+    monkeypatch.setattr(server, 'SESSION_SECRET', 'tooshort')
+    assert login(client).status_code == 503
+
+
+def test_the_legacy_admin_token_path_is_gone():
+    assert not hasattr(server, 'require_token')
+    assert not hasattr(server, 'ADMIN_TOKEN')
+
+
+# ------------------------------------------------------------- rejections
+
+def test_a_rejected_request_writes_nothing(client, db):
+    """The test that matters most: every refusal must leave the document and
+    the backup collection untouched."""
+    before = copy.deepcopy(db['resumes'].docs[0])
+    for headers, payload in [
+        ({}, {'updates': {'profile.description': 'HACKED'}}),
+        ({'Authorization': 'Bearer bad'}, {'updates': {'profile.description': 'HACKED'}}),
+        (auth(client), {'updates': {'profile.secret': 'HACKED'}}),
+        (auth(client), {'updates': {'experiences.work.0.title': 'HACKED'}}),
+        (auth(client), {'updates': {'profile.description': {'$ne': None}}}),
+        (auth(client), {'updates': {}}),
+    ]:
+        client.put('/updateResume', json=payload, headers=headers)
+    assert db['resumes'].docs[0] == before
+    assert db['backups'].inserted == []
+
+
+@pytest.mark.parametrize('path', [
+    'experiences.work.0.title',      # the index hazard, in its exact form
+    'experiences.work',              # whole arrays arrive in stage 4
+    'abilities.languages',
+    'profile',                       # a parent object
+    'profile.secret',
+    '__v',
+    '_id',
+    'quotes.3.quote',                # out of range
+    'quotes.0',
+    '$where',
+    'profile.description.$set',
+])
+def test_paths_outside_the_allowlist_are_refused(client, db, path):
+    r = client.put('/updateResume', json={'updates': {path: 'x'}}, headers=auth(client))
+    assert r.status_code == 400
+    assert r.get_json()['code'] == 'validation_failed'
+    assert r.get_json()['errors'][0]['path'] == path
+
+
+@pytest.mark.parametrize('value', [None, 42, 3.5, True, [], {}, {'$ne': None},
+                                   ['a'], {'a': 'b'}])
+def test_non_string_values_are_refused(client, db, value):
+    r = client.put('/updateResume', json={'updates': {'profile.description': value}},
+                   headers=auth(client))
+    assert r.status_code == 400
+
+
+def test_an_overlong_value_is_refused(client, db):
+    r = client.put('/updateResume',
+                   json={'updates': {'profile.description':
+                                     'x' * (server.MAX_FIELD_LENGTH + 1)}},
+                   headers=auth(client))
+    assert r.status_code == 400
+
+
+def test_one_bad_path_rejects_the_whole_batch(client, db):
+    before = db['resumes'].docs[0]['profile']['description']
+    r = client.put('/updateResume',
+                   json={'updates': {'profile.description': 'GOOD',
+                                     'profile.secret': 'BAD'}},
+                   headers=auth(client))
+    assert r.status_code == 400
+    assert db['resumes'].docs[0]['profile']['description'] == before
+
+
+# ------------------------------------------------------------- happy path
+
+def test_a_valid_edit_is_written(client, db):
+    r = client.put('/updateResume', json={'updates': {'profile.description': 'AFTER'}},
+                   headers=auth(client))
+    assert r.status_code == 200
+    assert db['resumes'].docs[0]['profile']['description'] == 'AFTER'
+
+
+def test_the_response_is_the_same_shape_getresume_returns(client, db):
+    put = client.put('/updateResume', json={'updates': {'profile.description': 'AFTER'}},
+                     headers=auth(client)).get_json()
+    get = client.get('/getResume').get_json()
+    assert put == get
+    assert '_id' not in put
+
+
+def test_every_allowlisted_path_is_actually_writable(client, db):
+    """Guards against a path being listed but unreachable — the allowlist and
+    the document shape must agree."""
+    for path in sorted(server.ALLOWLIST):
+        r = client.put('/updateResume', json={'updates': {path: 'value'}},
+                       headers=auth(client))
+        assert r.status_code == 200, f'{path} -> {r.get_json()}'
+
+
+def test_several_fields_write_together(client, db):
+    r = client.put('/updateResume',
+                   json={'updates': {'profile.name': 'A', 'links.email': 'b@c.d',
+                                     'quotes.1.by': '- Z'}},
+                   headers=auth(client))
+    assert r.status_code == 200
+    doc = db['resumes'].docs[0]
+    assert doc['profile']['name'] == 'A'
+    assert doc['links']['email'] == 'b@c.d'
+    assert doc['quotes'][1]['by'] == '- Z'
+
+
+# --------------------------------------------------------------- backups
+
+def test_a_backup_is_written_before_the_document_changes(client, db):
+    client.put('/updateResume', json={'updates': {'profile.description': 'AFTER'}},
+               headers=auth(client))
+    assert len(db['backups'].inserted) == 1
+    snapshot = db['backups'].inserted[0]
+    assert snapshot['previous']['profile']['description'] == 'BEFORE'
+    assert snapshot['actor'] == 'austin'
+    assert snapshot['changed_paths'] == ['profile.description']
+
+
+def test_the_backup_prune_keeps_the_newest_generations(client, db):
+    client.put('/updateResume', json={'updates': {'profile.description': 'x'}},
+               headers=auth(client))
+    assert db['backups'].deleted, 'prune never ran'
+    flt = db['backups'].deleted[-1]
+    assert '$nin' in flt['_id']
+
+
+# ----------------------------------------------------------------- shape
+
+def test_getresume_still_sorts_work_and_hides_id(client, db):
+    body = client.get('/getResume').get_json()
+    assert '_id' not in body
+    assert [w['company'] for w in body['experiences']['work']] == ['BeyondID', 'Ambii']
+
+
+def test_errors_are_json_not_html(client, db):
+    r = client.post('/getResume')            # 405
+    assert r.status_code == 405
+    assert r.is_json
+
+
+def test_only_the_expected_routes_exist():
+    rules = {r.rule for r in server.app.url_map.iter_rules() if r.endpoint != 'static'}
+    assert rules == {'/getResume', '/session', '/updateResume'}
+
+
+def test_every_write_route_is_guarded():
+    """Auth is usually lost by adding a route, not by breaking one."""
+    for rule in server.app.url_map.iter_rules():
+        methods = rule.methods - {'HEAD', 'OPTIONS'}
+        if rule.endpoint == 'static' or methods <= {'GET'}:
+            continue
+        if rule.rule == '/session':
+            continue
+        fn = server.app.view_functions[rule.endpoint]
+        assert getattr(fn, '__wrapped__', None) is not None, f'{rule.rule} is unguarded'

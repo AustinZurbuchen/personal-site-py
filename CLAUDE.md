@@ -20,16 +20,34 @@ there does not reach the NAS on its own.
 
 ## Layout
 
-- `server.py` — one route (`GET /getResume`), DB access, serialization.
+- `server.py` — three routes (`GET /getResume`, `POST /session`,
+  `PUT /updateResume`), DB access, serialization.
+- `test_server.py` — 64 tests, no network. Run `python -m pytest -q`.
+  `.dockerignore` keeps it out of the image.
 - `utils.py` — `sort_work_items`, ordering work experience current-first then
   by date. Applied in `GET /getResume`.
-- Collections: `resumes`, holding a single document.
+- Collections: `resumes` (one document), `admins` (one document per admin,
+  field is `password_hash` and never `password`), and `resume_backups` (one
+  document per applied write, capped at 50 generations).
 
-**The API surface is deliberately one read-only route.** Five other GET routes,
-`PUT /updateTest` and `POST /login` were deleted once an audit confirmed the
-frontend calls only `/getResume`; `/getExperiences` had already drifted to
-returning work unsorted. `require_token` is kept unused on purpose — the
-planned `PUT /updateResume` uses it.
+**Writes go through one allowlisted endpoint.** `PUT /updateResume` accepts
+`{"updates": {"<dotted path>": "<string>"}}` where every path must be a literal
+key in `ALLOWLIST`. That makes an index-addressed path like
+`experiences.work.2.title` **unrepresentable**, which matters: `sort_work_items`
+reorders work server-side and `generateLanguages` sorts abilities client-side,
+so a rendered row's index matches nothing in the database and an index-addressed
+write would silently update the wrong record.
+
+The `quotes.N.*` paths are index-addressed and that is safe — `quotes` is a
+fixed array of exactly three, never re-sorted, and the reducer backfills all
+three slots. The four re-sorted arrays are deliberately absent from the
+allowlist; they arrive in stage 4, written whole.
+
+**`ADMIN_TOKEN` and `require_token` are gone**, replaced by `require_session`.
+A door is only as strong as the weakest credential it accepts, and a
+non-expiring shared secret beside the session token would have made the real
+security one string in a `.env`. Remove `ADMIN_TOKEN` from the container's
+variables.
 
 `jsonify()` here is a local helper wrapping `bson.json_util`, **not**
 `flask.jsonify`. It passes Mongo extended JSON straight through, so responses
