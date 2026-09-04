@@ -31,8 +31,16 @@ there does not reach the NAS on its own.
 include `_id` as `{"$oid": "..."}`. The frontend tolerates this; changing the
 shape is a breaking change.
 
-Every GET calls `db.find_one()` with no filter and returns a subtree of the
-one resume document.
+Every GET calls `resumes().find_one()` with no filter and returns a subtree of
+the one resume document.
+
+**The MongoClient is built lazily, once, by `get_client()`.** Do not move it
+back to module scope. A `mongodb+srv://` URI resolves DNS inside the
+constructor, so at import a DNS failure raises during app load — and a gunicorn
+worker that dies loading the app exits 3, which the arbiter treats as fatal for
+the whole master. A transient blip at NAS boot would kill the container rather
+than one request. Built lazily, the same fault becomes a catchable 500 and the
+next request recovers. `connect=False` defers the SRV lookup as well.
 
 ## How it is reached
 
@@ -66,12 +74,14 @@ compose file. `Dockerfile` serves the app with gunicorn bound to
 This service is on the public internet. Write routes are gated by a shared
 bearer token; there is no per-user authentication.
 
-- **`PUT /updateTest` is guarded by a bearer token.** It requires
-  `Authorization: Bearer $ADMIN_TOKEN`, compared with `hmac.compare_digest`
-  by the `require_token` decorator, and scopes its write by `_id` rather than
-  the empty filter it used to use. The guard **fails closed**: with
-  `ADMIN_TOKEN` unset the route returns 503 instead of running
-  unauthenticated. Never "fix" that 503 by removing the decorator — set the
+- **`PUT /updateTest` is guarded by a bearer token.** The `require_token`
+  decorator requires `Authorization: Bearer $ADMIN_TOKEN` and scopes its write
+  by `_id` rather than the empty filter it used to use. The comparison is
+  `hmac.compare_digest` over **bytes**, not str: that function raises
+  `TypeError` on a str containing non-ASCII, so comparing the raw header turned
+  an unauthenticated request into a 500 instead of a 401. Encode both sides.
+  The guard **fails closed**: with `ADMIN_TOKEN` unset the route returns 503
+  instead of running unauthenticated. Never "fix" that 503 by removing the decorator — set the
   env var. Apply `@require_token` to every future write route.
 - **`POST /login` compares passwords in plaintext** (`admin['password'] !=
   data['password']`) and issues no token, cookie, or session on success — the
@@ -101,6 +111,19 @@ keys. Adding a new one means updating `.env.example` too.
 - The image runs as root and `hello.py` is still copied into it.
 - Route handlers other than `/getResume` have no error handling — a missing
   key raises and returns a 500 with a stack trace under debug.
+- The five non-`/getResume` GET routes and `/login` have no callers at all;
+  the frontend uses only `/getResume`. `/getExperiences` has already drifted —
+  it returns work unsorted, because `sort_work_items` was only applied in
+  `/getResume`.
+- `POST /login` raises on a `null` JSON body (`get_json()` without
+  `silent=True`), and its Mongo filter takes the request value directly, so
+  `{"username": {"$ne": null}}` matches any admin. It cannot bypass the
+  password — that check is a Python comparison, not a query — but it confirms
+  an admin exists.
+- `print()` is block-buffered under Docker and there is no `PYTHONUNBUFFERED`,
+  so the per-handler log convention below does not actually reach the NAS log
+  promptly.
+- The base image is Python 3.9, end-of-life since October 2025.
 - No tests.
 
 ## Conventions
