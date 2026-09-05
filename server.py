@@ -588,6 +588,77 @@ def version():
     return {"sha": GIT_SHA, "short": GIT_SHA[:7]}, 200
 
 
+# Metadata only, never the snapshots themselves. Fifty generations of a ~10KB
+# document is ~500KB, and the whole point of the list is CHOOSING one -- for
+# which a timestamp and the paths that changed are the useful facts. A row's
+# `previous` document stays where it is until someone deliberately reads it in
+# mongosh.
+MAX_BACKUPS_LISTED = BACKUP_KEEP
+
+
+@app.route('/backups', methods=['GET'])
+@require_session
+def list_backups():
+    """What was saved, when, by whom, and which paths moved.
+
+    ADMIN-ONLY THOUGH THE CONTENT IS PUBLIC. The resume this snapshots is served
+    to anyone, so the rows disclose nothing new -- but an edit HISTORY is
+    operational data about the owner (when they work, how often they revise),
+    which the resume itself does not publish. Gating it costs nothing and it is
+    the smaller of the two defaults to get wrong.
+
+    Deliberately NOT a restore, and deliberately not the road to one. A restore
+    is a whole-document replacement -- exactly the operation ALLOWLIST and
+    LIST_SCHEMAS exist to refuse -- so serving one over HTTP would rebuild the
+    unrestricted write path this API was locked down to remove. This endpoint
+    makes the recovery INFORMED: it tells you which generation you want, and the
+    restore itself stays a deliberate mongosh command.
+
+    Read-only and GET, so it passes the public vhost's `limit_except GET HEAD`
+    unchanged -- but it still answers 401 there without a token, which is what
+    actually protects it. The nginx clamp stops writes; require_session stops
+    this.
+    """
+    try:
+        rows = list(
+            backups()
+            .find({}, {'previous': 0})
+            .sort('created_at', DESCENDING)
+            .limit(MAX_BACKUPS_LISTED)
+        )
+    except Exception as e:
+        print(f"Backup list error: {str(e)}")
+        return SERVER_ERROR
+
+    return {"backups": [backup_view(row) for row in rows]}, 200
+
+
+def backup_view(row):
+    """One row, shaped for the wire.
+
+    Serialised by hand rather than through json_util, for the same reason
+    /getResume projects _id out: json_util emits extended JSON, so an id becomes
+    {"$oid": "..."} and a date becomes {"$date": ...}, and the client would have
+    to know MongoDB's wire dialect to read a list of timestamps.
+
+    Every field is defensive about missing or odd values. These rows were
+    written by older code paths and by whatever runs next year; a list of
+    backups that 500s because one row predates a field is a list that fails on
+    the day it is needed.
+    """
+    created = row.get('created_at')
+    return {
+        'id': str(row.get('_id', '')),
+        # ISO 8601 with an offset. The client renders it in local time; sending
+        # a preformatted string would bake this server's timezone into it.
+        'createdAt': created.isoformat() if hasattr(created, 'isoformat') else None,
+        'actor': row.get('actor') if isinstance(row.get('actor'), str) else None,
+        'changedPaths': [
+            p for p in (row.get('changed_paths') or []) if isinstance(p, str)
+        ],
+    }
+
+
 @app.route('/updateResume', methods=['PUT'])
 @require_session
 def update_resume():

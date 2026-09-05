@@ -44,8 +44,22 @@ RESUME = {
 
 
 class FakeCursor(list):
-    def sort(self, *a, **k):
-        return self
+    def sort(self, key, direction=1):
+        """Actually sorts, because a no-op here tests nothing.
+
+        It used to return self unchanged, which meant a server that forgot to
+        ask for an order -- or asked for the wrong one -- passed anyway, and any
+        assertion about ordering was really an assertion about insertion order.
+
+        Missing values go last when descending, matching MongoDB, which orders
+        null lowest. Rows written by older code have no created_at, and mixing
+        None with datetimes in one sorted() raises TypeError.
+        """
+        present = [d for d in self if d.get(key) is not None]
+        missing = [d for d in self if d.get(key) is None]
+        present.sort(key=lambda d: d[key], reverse=direction == -1)
+        ordered = present + missing if direction == -1 else missing + present
+        return FakeCursor(ordered)
 
     def limit(self, n):
         return FakeCursor(self[:n])
@@ -56,6 +70,11 @@ class FakeCollection:
         self.docs = docs if docs is not None else []
         self.inserted = []
         self.deleted = []
+        # What each find() was asked for. A projection is invisible in the
+        # RESULT when the caller discards the field anyway, so the only way to
+        # tell "asked the database not to send it" from "received it and threw
+        # it away" is to record the query.
+        self.finds = []
 
     def find_one(self, flt=None, projection=None):
         for d in self.docs:
@@ -67,6 +86,7 @@ class FakeCollection:
         return None
 
     def find(self, flt=None, projection=None):
+        self.finds.append({'filter': flt, 'projection': projection})
         return FakeCursor([copy.deepcopy(d) for d in self.docs])
 
     def update_one(self, flt, update):
@@ -382,7 +402,7 @@ def test_only_the_expected_routes_exist():
     arriving here without that edit is an endpoint nobody decided to publish.
     """
     rules = {r.rule for r in server.app.url_map.iter_rules() if r.endpoint != 'static'}
-    assert rules == {'/getResume', '/session', '/updateResume', '/version'}
+    assert rules == {'/backups', '/getResume', '/session', '/updateResume', '/version'}
 
 
 def test_every_write_route_is_guarded():
@@ -699,3 +719,141 @@ def test_git_sha_is_read_from_the_environment():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == 'deadbeefcafe'
+
+
+# ===========================================================================
+# GET /backups
+#
+# The safety net's index. Its tests are about what it must NOT do as much as
+# what it returns: no snapshots on the wire, nothing without a token, and no
+# 500 on a row written by older code.
+# ===========================================================================
+
+def test_backups_require_a_token(client, db):
+    r = client.get('/backups')
+    assert r.status_code == 401
+    assert 'backups' not in (r.get_json() or {})
+
+
+def test_backups_reject_a_bad_token(client, db):
+    r = client.get('/backups', headers={'Authorization': 'Bearer nonsense'})
+    assert r.status_code == 401
+
+
+def test_backups_never_return_the_snapshots(client, db):
+    """The whole prior document stays in the database.
+
+    Fifty generations of a ~10KB document is ~500KB, and none of it helps you
+    CHOOSE a generation. It is also the thing a restore would replace, so
+    keeping it off the wire keeps this endpoint from becoming the front half of
+    an unrestricted write path.
+    """
+    db['backups'].docs.append({
+        '_id': 'b1', 'resume_id': 'resume-1', 'actor': 'austin',
+        'created_at': __import__('datetime').datetime(2026, 9, 5, 12, 0, 0),
+        'changed_paths': ['profile.description'],
+        'previous': {'profile': {'description': 'THE OLD TEXT'}},
+    })
+
+    r = client.get('/backups', headers=auth(client))
+    assert r.status_code == 200
+    body = r.get_json()
+    assert 'THE OLD TEXT' not in r.get_data(as_text=True)
+    assert set(body['backups'][0]) == {'id', 'createdAt', 'actor', 'changedPaths'}
+    assert 'previous' not in body['backups'][0]
+
+
+def test_backups_ask_the_database_not_to_send_the_snapshots(client, db):
+    """The projection, not just the shape of the response.
+
+    backup_view already picks four fields, so dropping the projection changes
+    nothing a caller can see -- which is exactly why it needs its own test.
+    Two independent things keep snapshots off the wire, and only one of them was
+    covered: if backup_view ever grows a pass-through, the projection is what
+    still stops ~500KB of prior documents leaving the database.
+    """
+    db['backups'].docs.append({
+        '_id': 'b1', 'resume_id': 'resume-1', 'actor': 'austin',
+        'created_at': __import__('datetime').datetime(2026, 9, 5),
+        'changed_paths': ['profile.name'], 'previous': {'huge': 'x' * 1000},
+    })
+
+    client.get('/backups', headers=auth(client))
+
+    assert db['backups'].finds, 'the endpoint never queried the backups collection'
+    assert db['backups'].finds[-1]['projection'] == {'previous': 0}
+
+
+def test_backups_report_what_changed_and_when(client, db):
+    import datetime
+    db['backups'].docs.append({
+        '_id': 'b1', 'resume_id': 'resume-1', 'actor': 'austin',
+        'created_at': datetime.datetime(2026, 9, 5, 12, 0, 0, tzinfo=datetime.timezone.utc),
+        'changed_paths': ['abilities.languages', 'quotes.1.by'],
+        'previous': {},
+    })
+
+    row = client.get('/backups', headers=auth(client)).get_json()['backups'][0]
+    assert row['id'] == 'b1'
+    assert row['actor'] == 'austin'
+    assert row['changedPaths'] == ['abilities.languages', 'quotes.1.by']
+    # ISO 8601 with an offset, so the client can render local time. A
+    # preformatted string would bake the server's timezone in.
+    assert row['createdAt'].startswith('2026-09-05T12:00:00')
+    assert '+00:00' in row['createdAt'] or row['createdAt'].endswith('Z')
+
+
+def test_backups_survive_a_row_written_by_older_code(client, db):
+    """A list that 500s on one odd row is a list that fails when it is needed.
+
+    These records were written by code that has already changed once and will
+    change again; a missing actor or changed_paths must degrade, not explode.
+    """
+    db['backups'].docs.extend([
+        {'_id': 'old', 'resume_id': 'resume-1'},                    # no date, no actor
+        {'_id': 'partial', 'resume_id': 'resume-1', 'actor': 42,    # wrong type
+         'changed_paths': ['profile.name', 7, None]},               # mixed junk
+    ])
+
+    r = client.get('/backups', headers=auth(client))
+    assert r.status_code == 200
+    rows = {row['id']: row for row in r.get_json()['backups']}
+    assert rows['old']['createdAt'] is None
+    assert rows['old']['actor'] is None
+    assert rows['old']['changedPaths'] == []
+    assert rows['partial']['actor'] is None
+    # Non-strings dropped rather than serialised as junk the UI would render.
+    assert rows['partial']['changedPaths'] == ['profile.name']
+
+
+def test_backups_are_newest_first_and_capped(client, db):
+    import datetime
+    for i in range(server.BACKUP_KEEP + 10):
+        db['backups'].docs.append({
+            '_id': f'b{i}', 'resume_id': 'resume-1', 'actor': 'austin',
+            'created_at': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+            + datetime.timedelta(days=i),
+            'changed_paths': ['profile.name'], 'previous': {},
+        })
+
+    rows = client.get('/backups', headers=auth(client)).get_json()['backups']
+    assert len(rows) <= server.BACKUP_KEEP
+    stamps = [r['createdAt'] for r in rows]
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_backups_refuse_writes(client, db):
+    for method in ('post', 'put', 'delete', 'patch'):
+        assert getattr(client, method)('/backups').status_code in (401, 405)
+
+
+def test_backups_answer_when_the_collection_errors(client, db, monkeypatch):
+    """A dead collection is a 500 with a generic body, not a stack trace."""
+    class Boom:
+        def find(self, *a, **k):
+            raise RuntimeError('collection unavailable')
+
+    monkeypatch.setattr(server, 'backups', lambda: Boom())
+    r = client.get('/backups', headers=auth(client))
+    assert r.status_code == 500
+    assert 'collection unavailable' not in r.get_data(as_text=True)
