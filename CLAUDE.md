@@ -40,8 +40,24 @@ write would silently update the wrong record.
 
 The `quotes.N.*` paths are index-addressed and that is safe — `quotes` is a
 fixed array of exactly three, never re-sorted, and the reducer backfills all
-three slots. The four re-sorted arrays are deliberately absent from the
-allowlist; they arrive in stage 4, written whole.
+three slots. The four re-sorted arrays are absent from the scalar allowlist and are
+written **whole**, via `LIST_SCHEMAS` — the client sends the list back in the
+order it was served and the server validates every row and replaces the array,
+so no index ever crosses the wire.
+
+`LIST_SCHEMAS` requires the **exact** key set per row, including the three
+`experiences.work` keys nothing renders (`startDate`, `endDate`, `isCurrent`).
+That is not pedantry: a whole-array `$set` replaces the array, so a client
+echoing back only what it renders would delete those three — and they are
+precisely what `sort_work_items` orders by. Every sort key would collapse to
+`(0, '', '')`, the ordering would become a permanent no-op, and nothing would
+look wrong until the next row was added, because a stable sort leaves the
+just-written order alone. Requiring the full key set turns silent, delayed
+corruption into a 400 at the moment of the write.
+
+Requiring the exact key set is safe because all four lists are uniform in the
+live document. If that ever stops being true, the fix is to widen the schema
+deliberately, not to relax the check to a subset.
 
 **`ADMIN_TOKEN` and `require_token` are gone**, replaced by `require_session`.
 A door is only as strong as the weakest credential it accepts, and a
@@ -94,35 +110,54 @@ compose file. `Dockerfile` serves the app with gunicorn bound to
 
 ## Security posture — read before touching routes
 
-This service is on the public internet. Write routes are gated by a shared
-bearer token; there is no per-user authentication.
+This service is on the public internet. Write routes are gated by
+`@require_session`, which validates a signed, expiring token carrying a
+username. (An earlier version of this file described a shared `ADMIN_TOKEN`
+and `require_token`; both are gone.)
 
-- **`PUT /updateTest` is guarded by a bearer token.** The `require_token`
-  decorator requires `Authorization: Bearer $ADMIN_TOKEN` and scopes its write
-  by `_id` rather than the empty filter it used to use. The comparison is
-  `hmac.compare_digest` over **bytes**, not str: that function raises
-  `TypeError` on a str containing non-ASCII, so comparing the raw header turned
-  an unauthenticated request into a 500 instead of a 401. Encode both sides.
-  The guard **fails closed**: with `ADMIN_TOKEN` unset the route returns 503
-  instead of running unauthenticated. Never "fix" that 503 by removing the decorator — set the
-  env var. Apply `@require_token` to every future write route.
+- **`PUT /updateResume` is guarded by `@require_session`.** It requires
+  `Authorization: Bearer <session token>`, minted by `POST /session` against a
+  scrypt hash in the `admins` collection, and scopes its write by `_id` rather
+  than an empty filter. The guard **fails closed**: with
+  `ADMIN_SESSION_SECRET` unset it returns 503 rather than running
+  unauthenticated. Never "fix" that 503 by removing the decorator — set the env
+  var. Apply `@require_session` to every future write route.
+- The bytes-not-str lesson from the old `require_token` still applies to any
+  future secret comparison: `hmac.compare_digest` raises `TypeError` on a str
+  containing non-ASCII, which turns an unauthenticated request into a 500
+  instead of a 401. Encode both sides.
 - **The public API is read-only by proof, not convention.** The frontend's
   `nginx.conf` wraps `location /api/` in `limit_except GET HEAD { deny all; }`,
   so no non-GET method reaches Flask from the internet regardless of any
-  application bug. The planned admin vhost is a separate server block on an
-  unpublished port and does not carry that restriction. Do not remove it to
+  application bug. The admin vhost is a separate server block on port 8081,
+  bound to the LAN and never published through Nginx Proxy Manager, and does
+  not carry that restriction. Do not remove it to
   "make writes work" — that is what the admin vhost is for.
 - Credentials come from `.env` (`DBUSER`, `DBPASS`) and are interpolated into
   the connection string. `.env` is gitignored; keep it that way and never echo
   those values into logs or output.
-- No rate limiting anywhere. `PUT /updateTest` validates its body; no other
-  route validates input.
+- No rate limiting anywhere. `PUT /updateResume` validates its body against
+  the allowlist and the list schemas; no other route validates input.
 
-When adding a write endpoint, it needs `@require_token`, a scoped filter
+When adding a write endpoint, it needs `@require_session`, a scoped filter
 (never `{}`), and validation of the request body — in that order.
 
 Config lives in `.env` (gitignored); `.env.example` documents the required
 keys. Adding a new one means updating `.env.example` too.
+
+## Tests
+
+`python -m pytest -q` runs 99 cases in `test_server.py`, with **no network and
+no Atlas access**. `server.py` builds its `MongoClient` lazily inside
+`get_client()`, and that is the seam: the `db` fixture replaces the three
+collection accessors and monkeypatches `get_client` to raise. A test that
+reached the network would hang rather than fail, so the fake asserts it is the
+thing being used. Never write a test that bypasses that fixture — an earlier
+draft of the update tests paired a valid token with a valid body against the
+real cluster and was only stopped by missing local CA certificates.
+
+The bulk of the suite is the write path: session minting and expiry, the
+allowlist, and the `LIST_SCHEMAS` row validation described above.
 
 ## Known issues
 
@@ -137,7 +172,6 @@ keys. Adding a new one means updating `.env.example` too.
   so the per-handler log convention below does not actually reach the NAS log
   promptly.
 - The base image is Python 3.9, end-of-life since October 2025.
-- No tests.
 
 ## Conventions
 

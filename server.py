@@ -247,11 +247,25 @@ def create_session():
 # both sides.
 #
 # The four re-sorted arrays (experiences.work, experiences.school,
-# abilities.languages, abilities.technologies) are deliberately absent. They
-# arrive in stage 4, written whole, never by index.
+# abilities.languages, abilities.technologies) are therefore written WHOLE,
+# never by index -- see LIST_SCHEMAS below. The client sends the list back in
+# the order it was served; the server validates every row and replaces the
+# array. No index crosses the wire, so no index can mean the wrong thing.
 # ===========================================================================
 
 MAX_FIELD_LENGTH = 4000
+
+# Rows per list. The largest real list is 17 (abilities.technologies), so this
+# is ~3.5x headroom and still far below anything that would make the document
+# unwieldy. MAX_CONTENT_LENGTH caps the body at 256KB regardless; this exists
+# so the error says "too many rows" rather than a generic 413.
+MAX_ROWS = 60
+
+# One error per bad row would let a 60-row list generate 60 of them, and
+# adminApi.js joins every message into a single string rendered on the page.
+MAX_ERRORS = 20
+
+STARS = frozenset(('0', '1', '2', '3', '4', '5'))
 
 ALLOWLIST = frozenset((
     'profile.name',
@@ -271,12 +285,152 @@ ALLOWLIST = frozenset((
 ))
 
 
-def validate_updates(updates):
-    """Return (clean, errors). Every value must be a plain string.
+# ===========================================================================
+# Whole-list writes
+#
+# THE EXACT KEY SET IS THE POINT, not a formality. A whole-array $set REPLACES
+# the array, so a client that echoes back only the keys it renders
+# (company/dateLabel/title/body) DELETES isCurrent, startDate and endDate --
+# and those three are exactly what sort_work_items orders by. Every sort key
+# would collapse to (0, '', ''), the ordering would become a permanent no-op,
+# and nothing would look wrong until the next row was added, because a stable
+# sort leaves the just-written order alone. Requiring the full key set turns
+# that silent, delayed corruption into a 400 at the moment of the write.
+#
+# It is safe to require it: all four lists are uniform in the live document --
+# every school row has exactly these four keys, every work row exactly these
+# seven, every ability row exactly these two.
+#
+# The types are the OTHER half of the job the deleted `isinstance(value, str)`
+# check used to do alone. That one line was the whole defence against a Mongo
+# operator document reaching $set; a list value has to rebuild it structurally,
+# per leaf. Values are copied into fresh dicts below rather than passed through,
+# so nothing the caller sent is handed to the driver by reference.
+LIST_SCHEMAS = {
+    'experiences.school': {
+        'company': str, 'dateLabel': str, 'title': str, 'body': str,
+    },
+    'experiences.work': {
+        'company': str, 'dateLabel': str, 'title': str, 'body': str,
+        # Not rendered anywhere, and required anyway: sort_work_items reads
+        # exactly these three.
+        'startDate': str, 'endDate': str, 'isCurrent': bool,
+    },
+    'abilities.languages': {'ability': str, 'stars': str},
+    'abilities.technologies': {'ability': str, 'stars': str},
+}
 
-    The string check is what stops a Mongo operator document reaching $set:
-    {"$ne": null} is a dict, not a str, so it is rejected here rather than
-    interpreted by the database.
+
+def validate_list(path, value, schema):
+    """Return (rows, errors) for one whole-list path. rows is None if any error.
+
+    Errors keep `path` equal to the allowlist path and put the row index in
+    `detail`. That is deliberate: src/utils/adminApi.js keys field errors by the
+    same dotted path the drafts are keyed by, so an error reported against
+    'abilities.languages.2.stars' could never be matched to anything the UI
+    holds, and would be dropped on the floor.
+    """
+    errors = []
+
+    if not isinstance(value, list):
+        return None, [{"path": path,
+                       "detail": f"must be a list, got {type(value).__name__}"}]
+    if not value:
+        # An empty list is a section-wipe, and the UI has no gesture that
+        # produces one. Refused here so a bug upstream cannot blank a section.
+        return None, [{"path": path, "detail": "must not be empty"}]
+    if len(value) > MAX_ROWS:
+        return None, [{"path": path, "detail": f"more than {MAX_ROWS} rows"}]
+
+    expected = set(schema)
+    rows = []
+
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            errors.append({"path": path,
+                           "detail": f"row {index}: must be an object, "
+                                     f"got {type(row).__name__}"})
+            continue
+
+        got = set(row)
+        if got != expected:
+            missing = sorted(expected - got)
+            unexpected = sorted(str(k)[:40] for k in (got - expected))
+            parts = []
+            if missing:
+                parts.append("missing " + ", ".join(missing))
+            if unexpected:
+                parts.append("unexpected " + ", ".join(unexpected))
+            errors.append({"path": path,
+                           "detail": f"row {index}: " + "; ".join(parts)})
+            continue
+
+        clean_row = {}
+        ok = True
+        for key in sorted(expected):
+            wanted = schema[key]
+            raw = row[key]
+
+            if wanted is bool:
+                # isinstance(1, bool) is False, so an int 1 is refused here --
+                # which is right: sort_work_items branches on truthiness and a
+                # stray 1 would work until someone stored "0", which is truthy.
+                if not isinstance(raw, bool):
+                    errors.append({"path": path,
+                                   "detail": f"row {index}: {key} must be true "
+                                             f"or false, got {type(raw).__name__}"})
+                    ok = False
+                    continue
+            else:
+                # isinstance(True, str) is False, so a bool cannot slip into a
+                # string field even though bool subclasses int.
+                if not isinstance(raw, str):
+                    errors.append({"path": path,
+                                   "detail": f"row {index}: {key} must be a "
+                                             f"string, got {type(raw).__name__}"})
+                    ok = False
+                    continue
+                if len(raw) > MAX_FIELD_LENGTH:
+                    errors.append({"path": path,
+                                   "detail": f"row {index}: {key} is longer "
+                                             f"than {MAX_FIELD_LENGTH} characters"})
+                    ok = False
+                    continue
+
+            clean_row[key] = raw
+
+        if ok and 'stars' in expected and clean_row.get('stars') not in STARS:
+            errors.append({"path": path,
+                           "detail": f"row {index}: stars must be one of "
+                                     f"{', '.join(sorted(STARS))}"})
+            ok = False
+
+        if ok:
+            # A NEW dict, built from the schema's keys only. Never the caller's
+            # object, so nothing unvalidated reaches the driver by reference.
+            rows.append(clean_row)
+
+    if errors:
+        return None, errors
+    return rows, []
+
+
+def validate_updates(updates):
+    """Return (clean, errors). Two kinds of path, validated differently.
+
+    A SCALAR path (ALLOWLIST) takes a plain string. The string check is what
+    stops a Mongo operator document reaching $set: {"$ne": null} is a dict, not
+    a str, so it is rejected here rather than interpreted by the database.
+
+    A LIST path (LIST_SCHEMAS) takes a whole array of rows, because the four
+    array sections are re-sorted -- server-side for experiences.work,
+    client-side for both abilities lists -- so a rendered row's index matches
+    nothing stored and an index-addressed write would hit the wrong record.
+    validate_list rebuilds the same defence structurally, per leaf, and returns
+    fresh dicts rather than the caller's objects.
+
+    All or nothing: one bad path rejects the whole batch, so a partially
+    applied save is not a state this endpoint can produce.
     """
     errors = []
     clean = {}
@@ -287,9 +441,20 @@ def validate_updates(updates):
         return None, [{"path": "updates", "detail": "must not be empty"}]
 
     for path, value in updates.items():
-        if not isinstance(path, str) or path not in ALLOWLIST:
+        if not isinstance(path, str) or (
+            path not in ALLOWLIST and path not in LIST_SCHEMAS
+        ):
             errors.append({"path": str(path)[:80], "detail": "not a writable field"})
             continue
+
+        if path in LIST_SCHEMAS:
+            rows, row_errors = validate_list(path, value, LIST_SCHEMAS[path])
+            if row_errors:
+                errors.extend(row_errors)
+                continue
+            clean[path] = rows
+            continue
+
         if not isinstance(value, str):
             errors.append({"path": path,
                            "detail": f"must be a string, got {type(value).__name__}"})
@@ -300,7 +465,19 @@ def validate_updates(updates):
             continue
         clean[path] = value
 
-    return (None, errors) if errors else (clean, [])
+    if errors:
+        return None, errors[:MAX_ERRORS]
+
+    # Asserted rather than assumed: the caller hands `clean` straight to
+    # {'$set': clean}, and MongoDB refuses an empty $set with an OperationFailure
+    # that the route's broad except would report as a 500 for a request that was
+    # in fact merely empty. The `if not updates` guard above makes this
+    # unreachable today; it stays so a future path that can validate to nothing
+    # cannot reintroduce it silently.
+    if not clean:
+        return None, [{"path": "updates", "detail": "must not be empty"}]
+
+    return clean, []
 
 
 # ===========================================================================

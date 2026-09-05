@@ -390,3 +390,220 @@ def test_every_write_route_is_guarded():
             continue
         fn = server.app.view_functions[rule.endpoint]
         assert getattr(fn, '__wrapped__', None) is not None, f'{rule.rule} is unguarded'
+
+
+# ------------------------------------------------------- whole-list writes
+#
+# The four array sections are written whole because they are re-sorted --
+# experiences.work by sort_work_items on the server, both abilities lists by
+# generateLanguages/generateTechnologies on the client -- so a rendered row's
+# index matches nothing stored. No index crosses the wire, so these tests are
+# about the SHAPE of a list rather than about addressing one row.
+
+WORK_ROW = {'company': 'BeyondID', 'dateLabel': 'a', 'title': 't', 'body': 'b',
+            'isCurrent': False, 'startDate': '2021', 'endDate': '2022'}
+SCHOOL_ROW = {'company': 'SJSU', 'dateLabel': 'May 2018', 'title': 'BS', 'body': '.'}
+LANG_ROW = {'ability': 'ReactJS', 'stars': '5'}
+
+
+def put(client, updates):
+    return client.put('/updateResume', json={'updates': updates}, headers=auth(client))
+
+
+def test_a_whole_list_replaces_the_section(client, db):
+    rows = [dict(WORK_ROW, company='Ambii'), dict(WORK_ROW, company='Google')]
+    r = put(client, {'experiences.work': rows})
+    assert r.status_code == 200
+    stored = db['resumes'].docs[0]['experiences']['work']
+    assert [w['company'] for w in stored] == ['Ambii', 'Google']
+
+
+def test_every_list_path_is_writable(client, db):
+    r = put(client, {
+        'experiences.school': [SCHOOL_ROW],
+        'experiences.work': [WORK_ROW],
+        'abilities.languages': [LANG_ROW],
+        'abilities.technologies': [dict(LANG_ROW, ability='Git')],
+    })
+    assert r.status_code == 200
+
+
+def test_a_row_missing_the_unrendered_keys_is_refused(client, db):
+    """The single most important test in this file.
+
+    The UI renders only company/dateLabel/title/body. A client that echoes back
+    what it renders would $set a work list without isCurrent/startDate/endDate,
+    and $set REPLACES the array -- so those three would be deleted. They are
+    exactly what sort_work_items orders by, so every key would collapse to
+    (0, '', ''), the ordering would become a permanent no-op, and the damage
+    would be invisible until the next row was added, because a stable sort
+    leaves the just-written order alone.
+    """
+    before = copy.deepcopy(db['resumes'].docs[0]['experiences']['work'])
+    rendered_only = {'company': 'A', 'dateLabel': 'x', 'title': 't', 'body': 'b'}
+
+    r = put(client, {'experiences.work': [rendered_only]})
+
+    assert r.status_code == 400
+    assert r.get_json()['code'] == 'validation_failed'
+    detail = r.get_json()['errors'][0]['detail']
+    assert 'missing' in detail
+    for key in ('endDate', 'isCurrent', 'startDate'):
+        assert key in detail
+    # And nothing was written.
+    assert db['resumes'].docs[0]['experiences']['work'] == before
+
+
+def test_a_mongo_operator_row_is_refused(client, db):
+    """isinstance(value, str) used to be the whole defence against an operator
+    document reaching $set. A list value cannot use it, so the row schema has
+    to rebuild it -- an operator key is simply not in the expected key set."""
+    r = put(client, {'abilities.languages': [{'$ne': None}]})
+    assert r.status_code == 400
+    assert 'unexpected $ne' in r.get_json()['errors'][0]['detail']
+
+
+def test_a_mongo_operator_as_a_value_is_refused(client, db):
+    r = put(client, {'abilities.languages': [{'ability': {'$gt': ''}, 'stars': '5'}]})
+    assert r.status_code == 400
+    assert 'must be a string, got dict' in r.get_json()['errors'][0]['detail']
+
+
+def test_an_empty_list_cannot_wipe_a_section(client, db):
+    before = copy.deepcopy(db['resumes'].docs[0]['abilities']['languages'])
+    r = put(client, {'abilities.languages': []})
+    assert r.status_code == 400
+    assert db['resumes'].docs[0]['abilities']['languages'] == before
+
+
+def test_unknown_keys_in_a_row_are_refused(client, db):
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, sneaky='1')]})
+    assert r.status_code == 400
+    assert 'unexpected sneaky' in r.get_json()['errors'][0]['detail']
+
+
+def test_a_dotted_key_in_a_row_is_refused(client, db):
+    """A dotted key would be interpreted as a path by some drivers."""
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, **{'a.b': '1'})]})
+    assert r.status_code == 400
+    assert 'unexpected a.b' in r.get_json()['errors'][0]['detail']
+
+
+@pytest.mark.parametrize('value', ['nope', 42, None, {'0': LANG_ROW}])
+def test_a_list_path_requires_an_actual_list(client, db, value):
+    r = put(client, {'abilities.languages': value})
+    assert r.status_code == 400
+    assert 'must be a list' in r.get_json()['errors'][0]['detail']
+
+
+def test_too_many_rows_are_refused(client, db):
+    r = put(client, {'abilities.languages': [LANG_ROW] * (server.MAX_ROWS + 1)})
+    assert r.status_code == 400
+    assert f'more than {server.MAX_ROWS} rows' in r.get_json()['errors'][0]['detail']
+
+
+@pytest.mark.parametrize('stars', ['9', '-1', '', 'five', '3.0'])
+def test_stars_outside_zero_to_five_are_refused(client, db, stars):
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, stars=stars)]})
+    assert r.status_code == 400
+    assert 'stars must be one of' in r.get_json()['errors'][0]['detail']
+
+
+@pytest.mark.parametrize('stars', ['0', '1', '2', '3', '4', '5'])
+def test_every_valid_star_count_is_accepted(client, db, stars):
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, stars=stars)]})
+    assert r.status_code == 200
+
+
+def test_stars_must_be_a_string_not_a_number(client, db):
+    """The document stores star counts as strings ('5'), and normalizeStars on
+    the client coerces. Accepting an int here would let the two representations
+    diverge in one collection."""
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, stars=5)]})
+    assert r.status_code == 400
+    assert 'stars must be a string, got int' in r.get_json()['errors'][0]['detail']
+
+
+def test_isCurrent_must_be_a_real_bool(client, db):
+    """isinstance(1, bool) is False, and that is wanted: sort_work_items
+    branches on truthiness, so a stray 1 would work right up until someone
+    stored the string '0', which is truthy."""
+    r = put(client, {'experiences.work': [dict(WORK_ROW, isCurrent=1)]})
+    assert r.status_code == 400
+    assert 'isCurrent must be true or false, got int' in r.get_json()['errors'][0]['detail']
+
+
+def test_a_bool_cannot_pass_as_a_string_field(client, db):
+    r = put(client, {'abilities.languages': [dict(LANG_ROW, ability=True)]})
+    assert r.status_code == 400
+    assert 'ability must be a string, got bool' in r.get_json()['errors'][0]['detail']
+
+
+def test_a_row_value_longer_than_the_cap_is_refused(client, db):
+    r = put(client, {'experiences.school': [dict(SCHOOL_ROW, body='z' * 4001)]})
+    assert r.status_code == 400
+    assert 'longer than' in r.get_json()['errors'][0]['detail']
+
+
+def test_errors_name_the_row_but_keep_the_path_the_ui_knows(client, db):
+    """src/utils/adminApi.js keys field errors by the same dotted path the
+    drafts are keyed by. An error reported against 'abilities.languages.2.stars'
+    could never match anything the UI holds, so the index goes in `detail`."""
+    rows = [LANG_ROW, LANG_ROW, dict(LANG_ROW, stars='9')]
+    r = put(client, {'abilities.languages': rows})
+    assert r.status_code == 400
+    error = r.get_json()['errors'][0]
+    assert error['path'] == 'abilities.languages'
+    assert error['detail'].startswith('row 2:')
+
+
+def test_the_error_list_is_capped(client, db):
+    rows = [dict(LANG_ROW, stars='9')] * 40
+    r = put(client, {'abilities.languages': rows})
+    assert r.status_code == 400
+    assert len(r.get_json()['errors']) <= server.MAX_ERRORS
+
+
+def test_one_bad_row_rejects_the_whole_batch(client, db):
+    before = copy.deepcopy(db['resumes'].docs[0])
+    r = put(client, {'profile.name': 'Ada',
+                     'abilities.languages': [dict(LANG_ROW, stars='9')]})
+    assert r.status_code == 400
+    assert db['resumes'].docs[0] == before
+
+
+def test_the_stored_row_is_rebuilt_not_the_callers_object(client, db):
+    """Values are copied into fresh dicts keyed only by the schema, so nothing
+    the caller sent reaches the driver by reference."""
+    sent = dict(LANG_ROW)
+    r = put(client, {'abilities.languages': [sent]})
+    assert r.status_code == 200
+    stored = db['resumes'].docs[0]['abilities']['languages'][0]
+    assert stored == LANG_ROW
+    assert stored is not sent
+
+
+def test_a_list_write_is_backed_up_like_any_other(client, db):
+    put(client, {'abilities.languages': [LANG_ROW]})
+    record = db['backups'].inserted[-1]
+    assert record['changed_paths'] == ['abilities.languages']
+    assert record['actor'] == 'austin'
+    assert record['previous']['abilities']['languages'] == [{'ability': 'ReactJS', 'stars': '5'}]
+
+
+def test_index_addressed_array_paths_remain_unwritable(client, db):
+    """The whole point of writing lists whole. These must stay refused."""
+    for path in ('experiences.work.0.title', 'abilities.languages.0.stars',
+                 'experiences.school.0.company'):
+        r = put(client, {path: 'x'})
+        assert r.status_code == 400, path
+        assert r.get_json()['errors'][0]['detail'] == 'not a writable field'
+
+
+def test_writing_back_the_served_work_order_is_idempotent(client, db):
+    """The client sends the list back in the order it was served, and that
+    order is sort_work_items' own output -- so a save must not reshuffle it."""
+    served = client.get('/getResume').get_json()['experiences']['work']
+    r = put(client, {'experiences.work': served})
+    assert r.status_code == 200
+    assert r.get_json()['experiences']['work'] == served
