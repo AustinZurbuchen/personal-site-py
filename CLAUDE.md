@@ -20,8 +20,19 @@ there does not reach the NAS on its own.
 
 ## Layout
 
-- `server.py` — three routes (`GET /getResume`, `POST /session`,
+- `server.py` — four routes (`GET /getResume`, `GET /version`, `POST /session`,
   `PUT /updateResume`), DB access, serialization.
+
+`GET /version` reports the commit baked into the image by the Dockerfile's
+`GIT_SHA` ARG. It exists because a deploy was unverifiable: every other response
+is byte-identical across builds, so an API container left on a stale image
+answers every probe exactly as a fresh one would. One sat that way through four
+site deploys, and the first sign was a save failing with "not a writable field"
+for a path the current code allows. Unauthenticated and GET on purpose —
+needing a password to check a deploy is what let that one go unchecked — and it
+touches no database, so it can tell a bad deploy apart from a bad Atlas.
+`test_only_the_expected_routes_exist` pins the route set, so a fifth route is
+added deliberately or not at all.
 - `test_server.py` — 64 tests, no network. Run `python -m pytest -q`.
   `.dockerignore` keeps it out of the image.
 - `utils.py` — `sort_work_items`, ordering work experience current-first then

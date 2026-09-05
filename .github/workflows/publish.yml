@@ -50,6 +50,10 @@ jobs:
           # produce an image the NAS refuses with "exec format error".
           platforms: linux/amd64
           push: true
+          # Baked into the image so GET /version can report which commit is
+          # running. github.sha is the full 40-char commit of this push.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

@@ -376,8 +376,13 @@ def test_errors_are_json_not_html(client, db):
 
 
 def test_only_the_expected_routes_exist():
+    """An exact set, so a route is exposed on purpose or not at all.
+
+    /version was added deliberately and this line updated with it. Anything
+    arriving here without that edit is an endpoint nobody decided to publish.
+    """
     rules = {r.rule for r in server.app.url_map.iter_rules() if r.endpoint != 'static'}
-    assert rules == {'/getResume', '/session', '/updateResume'}
+    assert rules == {'/getResume', '/session', '/updateResume', '/version'}
 
 
 def test_every_write_route_is_guarded():
@@ -607,3 +612,90 @@ def test_writing_back_the_served_work_order_is_idempotent(client, db):
     r = put(client, {'experiences.work': served})
     assert r.status_code == 200
     assert r.get_json()['experiences']['work'] == served
+
+
+# ===========================================================================
+# GET /version
+#
+# The endpoint exists because a deploy was unverifiable, so its tests are about
+# the two properties that make it usable at all: no credential, no database.
+# ===========================================================================
+
+def test_version_needs_no_token(client):
+    # The whole point. Needing a credential to check a deploy is what made the
+    # last one go unchecked -- and every other route here either returns the
+    # same document on any build or answers 401.
+    r = client.get('/version')
+    assert r.status_code == 200
+    assert set(r.get_json()) == {'sha', 'short'}
+
+
+def test_version_answers_while_the_database_is_dead(client, monkeypatch):
+    # It has to distinguish a bad DEPLOY from a bad DATABASE, so it must not
+    # touch Atlas. Note this test deliberately does NOT use the `db` fixture:
+    # nothing is stubbed, so any collection access would raise.
+    def boom():
+        raise AssertionError('/version touched the database')
+
+    monkeypatch.setattr(server, 'resumes', boom)
+    monkeypatch.setattr(server, 'admins', boom)
+    monkeypatch.setattr(server, 'backups', boom)
+    monkeypatch.setattr(server, 'get_client', boom)
+
+    r = client.get('/version')
+    assert r.status_code == 200
+
+
+def test_version_reports_the_baked_in_sha(client, monkeypatch):
+    monkeypatch.setattr(server, 'GIT_SHA', 'b9e8837fdac98733e9600dfdf7a071808bb137eb')
+    body = client.get('/version').get_json()
+    assert body['sha'] == 'b9e8837fdac98733e9600dfdf7a071808bb137eb'
+    # Short form so a human can compare it to `git log --oneline` at a glance.
+    assert body['short'] == 'b9e8837'
+
+
+def test_version_says_unknown_rather_than_guessing(client, monkeypatch):
+    # A local `flask run` has no ARG baked in. Reporting an empty string, or the
+    # string "None", would look like a real answer in a deploy check.
+    monkeypatch.setattr(server, 'GIT_SHA', 'unknown')
+    assert client.get('/version').get_json() == {'sha': 'unknown', 'short': 'unknown'}
+
+
+def test_version_refuses_writes(client):
+    # It sits under the same /api/ proxy as everything else. The public vhost's
+    # limit_except stops non-GET at the edge, but the route must not accept them
+    # either -- the admin vhost carries no such restriction.
+    for method in ('post', 'put', 'delete', 'patch'):
+        assert getattr(client, method)('/version').status_code == 405
+
+
+def test_git_sha_is_read_from_the_environment():
+    """The wiring, not just the route.
+
+    Every test above monkeypatches server.GIT_SHA, so all of them would still
+    pass if the Dockerfile's ENV name and the os.getenv call disagreed -- and
+    the endpoint would report "unknown" for ever while looking healthy. That is
+    precisely the silent-uselessness this endpoint exists to prevent, so it gets
+    its own check.
+
+    A subprocess rather than importlib.reload: reloading server rebuilds the
+    Flask app other tests hold a reference to.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        'import os;'
+        'os.environ["GIT_SHA"]="deadbeefcafe";'
+        'os.environ.setdefault("ADMIN_SESSION_SECRET","k"*40);'
+        'os.environ.setdefault("DBUSER","u");'
+        'os.environ.setdefault("DBPASS","p");'
+        'import server;'
+        'print(server.GIT_SHA)'
+    )
+    out = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True, text=True, cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == 'deadbeefcafe'

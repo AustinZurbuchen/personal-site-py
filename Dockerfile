@@ -7,6 +7,19 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
+# The commit this image was built from, so a running container can say which
+# code it is actually serving. Everything else about a build looks identical
+# from outside -- which is how an API container sat on a stale image through
+# four site deploys, answering every probe exactly as the new one would.
+#
+# An ARG with a default, not a required one: a local `docker build` with no
+# --build-arg still works and simply reports "unknown". CI passes the real SHA.
+# It goes in AFTER `COPY . .` on purpose -- an ARG that changes every commit
+# would otherwise invalidate the dependency layer above it and reinstall pip on
+# every build.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
+
 # Make port 5000 available outside the container
 EXPOSE 5000
 

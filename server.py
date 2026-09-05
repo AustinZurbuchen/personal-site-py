@@ -48,6 +48,11 @@ MAX_PASSWORD_LENGTH = 1024
 # Refuse an oversized body before Flask parses JSON and before scrypt runs.
 MAX_CONTENT_LENGTH = 256 * 1024
 
+# The commit this image was built from, baked in by the Dockerfile's ARG. Empty
+# outside a built image (a local `flask run`), which reports "unknown" rather
+# than pretending to know.
+GIT_SHA = (os.getenv('GIT_SHA') or '').strip() or 'unknown'
+
 # Generations kept per resume. A count, not a capped collection (which evicts
 # by bytes, so retention depends on how long the description happens to be)
 # and not a TTL index (age-based retention is backwards here — go quiet for two
@@ -553,6 +558,34 @@ def get_resume():
     except Exception as e:
         print(f"Database error: {str(e)}")
         return SERVER_ERROR
+
+
+@app.route('/version', methods=['GET'])
+def version():
+    """Which commit this container is running.
+
+    THIS EXISTS BECAUSE A DEPLOY WAS UNVERIFIABLE. Every other response this API
+    gives is byte-identical across builds -- /getResume returns the document,
+    /session and /updateResume answer 401 without a token -- so an API container
+    left on a stale image is indistinguishable from a fresh one from outside. One
+    sat that way through four site deploys, and the first sign was a save failing
+    with "not a writable field" for a path the current code allows. The frontend
+    never had this problem: its bundle filename is a content hash, so a stale
+    site container announces itself.
+
+    Unauthenticated, and GET, so it passes the public vhost's
+    `limit_except GET HEAD` unchanged and can be checked without a password --
+    which is the whole point, since needing a credential to verify a deploy is
+    what made the last one go unverified.
+
+    The disclosure is a commit SHA of a PUBLIC repository, so it reveals nothing
+    that is not already on GitHub. If this repo is ever made private, restrict
+    this route to the admin vhost rather than leaving it open by inertia.
+
+    No database call: it must answer while Atlas is unreachable, or it cannot be
+    used to tell a bad deploy apart from a bad database.
+    """
+    return {"sha": GIT_SHA, "short": GIT_SHA[:7]}, 200
 
 
 @app.route('/updateResume', methods=['PUT'])
